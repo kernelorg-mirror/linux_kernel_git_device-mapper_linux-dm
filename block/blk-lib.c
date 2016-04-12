@@ -314,3 +314,29 @@ int blkdev_issue_zeroout(struct block_device *bdev, sector_t sector,
 	return __blkdev_issue_zeroout(bdev, sector, nr_sects, gfp_mask);
 }
 EXPORT_SYMBOL(blkdev_issue_zeroout);
+
+/**
+ * blkdev_ensure_space_exists - preallocate a block range
+ * @bdev:	blockdev to preallocate space for
+ * @sector:	start sector
+ * @nr_sects:	number of sectors to preallocate
+ * @gfp_mask:	memory allocation flags (for bio_alloc)
+ * @flags:	FALLOC_FL_* to control behaviour
+ *
+ * Description:
+ *    Ensure space exists, or is preallocated, for the sectors in question.
+ */
+int blkdev_ensure_space_exists(struct block_device *bdev, sector_t sector,
+		sector_t nr_sects, unsigned long flags)
+{
+	sector_t res;
+	const struct block_device_operations *ops = bdev->bd_disk->fops;
+
+	if (!ops->reserve_space)
+		return -EOPNOTSUPP;
+
+	// FIXME: check with Brian Foster on whether it makes sense to
+	// use BDEV_RES_GET/BDEV_RES_MOD instead of BDEV_RES_PROVISION?
+	return ops->reserve_space(bdev, BDEV_RES_PROVISION, sector, nr_sects, &res);
+}
+EXPORT_SYMBOL(blkdev_ensure_space_exists);

@@ -1801,15 +1801,11 @@ long blkdev_fallocate(struct file *file, int mode, loff_t start, loff_t len)
 	struct request_queue *q = bdev_get_queue(bdev);
 	struct address_space *mapping;
 	loff_t end = start + len - 1;
-	loff_t bs_mask, isize;
+	loff_t isize;
 	int error;
 
 	/* We only support zero range and punch hole. */
 	if (mode & ~BLKDEV_FALLOC_FL_SUPPORTED)
-		return -EOPNOTSUPP;
-
-	/* We haven't a primitive for "ensure space exists" right now. */
-	if (!(mode & ~FALLOC_FL_KEEP_SIZE))
 		return -EOPNOTSUPP;
 
 	/* Only punch if the device can do zeroing discard. */
@@ -1829,9 +1825,12 @@ long blkdev_fallocate(struct file *file, int mode, loff_t start, loff_t len)
 			return -EINVAL;
 	}
 
-	/* Don't allow IO that isn't aligned to logical block size */
-	bs_mask = bdev_logical_block_size(bdev) - 1;
-	if ((start | len) & bs_mask)
+	/*
+	 * Don't allow IO that isn't aligned to minimum IO size (io_min)
+	 * - for normal device's io_min is usually logical block size
+	 * - but for more exotic devices (e.g. DM thinp) it may be larger
+	 */
+	if ((start | len) % bdev_io_min(bdev))
 		return -EINVAL;
 
 	/* Invalidate the page cache, including dirty pages. */
@@ -1839,7 +1838,10 @@ long blkdev_fallocate(struct file *file, int mode, loff_t start, loff_t len)
 	truncate_inode_pages_range(mapping, start, end);
 
 	error = -EINVAL;
-	if (mode & FALLOC_FL_ZERO_RANGE)
+	if (!(mode & ~FALLOC_FL_KEEP_SIZE))
+		error = blkdev_ensure_space_exists(bdev, start >> 9, len >> 9,
+						   mode);
+	else if (mode & FALLOC_FL_ZERO_RANGE)
 		error = blkdev_issue_zeroout(bdev, start >> 9, len >> 9,
 					    GFP_KERNEL, false);
 	else if (mode & FALLOC_FL_PUNCH_HOLE)
