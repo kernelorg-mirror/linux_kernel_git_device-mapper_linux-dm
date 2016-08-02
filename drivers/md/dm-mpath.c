@@ -433,17 +433,23 @@ failed:
  */
 static int must_push_back(struct multipath *m)
 {
-	bool r;
+	bool queue_if_no_path, suspend_active, suspending;
 	unsigned long flags;
 
 	spin_lock_irqsave(&m->lock, flags);
-	r = (test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags) ||
-	     ((test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags) !=
-	       test_bit(MPATHF_SAVED_QUEUE_IF_NO_PATH, &m->flags)) &&
-	      dm_noflush_suspending(m->ti)));
+
+        queue_if_no_path = test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags);
+        suspend_active = (test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags) !=
+			  test_bit(MPATHF_SAVED_QUEUE_IF_NO_PATH, &m->flags));
+        suspending = (suspend_active && dm_noflush_suspending(m->ti));
+
 	spin_unlock_irqrestore(&m->lock, flags);
 
-	return r;
+        if (!queue_if_no_path || !suspending)
+                DMERR_LIMIT("%s: queue_if_no_path=%d suspend_active=%d suspending=%d",
+                            __func__, queue_if_no_path, suspend_active, suspending);
+
+	return (queue_if_no_path || suspending);
 }
 
 /*
