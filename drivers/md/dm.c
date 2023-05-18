@@ -1616,6 +1616,7 @@ static bool is_abnormal_io(struct bio *bio)
 		case REQ_OP_DISCARD:
 		case REQ_OP_SECURE_ERASE:
 		case REQ_OP_WRITE_ZEROES:
+		case REQ_OP_PROVISION:
 			return true;
 		default:
 			break;
@@ -1650,6 +1651,12 @@ static blk_status_t __process_abnormal_io(struct clone_info *ci,
 		num_bios = ti->num_write_zeroes_bios;
 		max_sectors = limits->max_write_zeroes_sectors;
 		if (ti->max_write_zeroes_granularity)
+			max_granularity = max_sectors;
+		break;
+	case REQ_OP_PROVISION:
+		num_bios = ti->num_provision_bios;
+		max_sectors = limits->max_provision_sectors;
+		if (ti->max_provision_granularity)
 			max_granularity = max_sectors;
 		break;
 	default:
