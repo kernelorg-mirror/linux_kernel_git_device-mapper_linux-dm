@@ -219,6 +219,8 @@ struct pool_features {
 	bool zero_new_blocks:1;
 	bool discard_enabled:1;
 	bool discard_passdown:1;
+	bool provision_enabled:1;
+	bool provision_passdown:1;
 	bool error_if_no_space:1;
 };
 
@@ -1324,8 +1326,10 @@ static void schedule_copy(struct thin_c *tc, dm_block_t virt_block,
 	m->data_block = data_dest;
 	m->cell = cell;
 
-	if (bio_op(bio) == REQ_OP_PROVISION)
-		m->bio = bio;
+	if (bio_op(bio) == REQ_OP_PROVISION) {
+		if (!pool->pf.provision_passdown)
+			m->bio = bio; /* no_provision_passdown */
+	}
 
 	/*
 	 * quiesce action + copy action + an extra reference held for the
@@ -1396,8 +1400,10 @@ static void schedule_zero(struct thin_c *tc, dm_block_t virt_block,
 	m->data_block = data_block;
 	m->cell = cell;
 
-	if (bio && bio_op(bio) == REQ_OP_PROVISION)
-		m->bio = bio;
+	if (bio && bio_op(bio) == REQ_OP_PROVISION) {
+		if (!pool->pf.provision_passdown)
+			m->bio = bio; /* no_provision_passdown */
+	}
 
 	/*
 	 * If the whole block of data is being overwritten or we are not
@@ -1966,6 +1972,15 @@ static void process_provision_bio(struct thin_c *tc, struct bio *bio)
 	struct dm_bio_prison_cell *cell;
 	struct dm_cell_key key;
 	struct dm_thin_lookup_result lookup_result;
+
+	/*
+	 * FIXME:
+	 * Current REQ_OP_PROVISION support does _not_ make any guarantee
+	 * that a snapshot device inherits all previous reservations.
+	 *
+	 * Future support will implement this reservation design:
+	 * https://listman.redhat.com/archives/dm-devel/2023-May/054351.html
+	 */
 
 	/*
 	 * If cell is already occupied, then the block is already
@@ -2921,6 +2936,32 @@ static void disable_discard_passdown_if_not_supported(struct pool_c *pt)
 	}
 }
 
+/*
+ * If provision_passdown was enabled verify that the data device
+ * supports provisions.  Disable provision_passdown if not.
+ */
+static void disable_provision_passdown_if_not_supported(struct pool_c *pt)
+{
+	struct pool *pool = pt->pool;
+	struct block_device *data_bdev = pt->data_dev->bdev;
+	struct queue_limits *data_limits = &bdev_get_queue(data_bdev)->limits;
+	const char *reason = NULL;
+
+	if (!pt->adjusted_pf.provision_passdown)
+		return;
+
+	if (!bdev_max_provision_sectors(pt->data_dev->bdev))
+		reason = "provision unsupported";
+
+	else if (data_limits->max_provision_sectors < pool->sectors_per_block)
+		reason = "max provision sectors smaller than a block";
+
+	if (reason) {
+		DMWARN("Data device (%pg) %s: Disabling provision passdown.", data_bdev, reason);
+		pt->adjusted_pf.provision_passdown = false;
+	}
+}
+
 static int bind_control_target(struct pool *pool, struct dm_target *ti)
 {
 	struct pool_c *pt = ti->private;
@@ -2965,6 +3006,8 @@ static void pool_features_init(struct pool_features *pf)
 	pf->zero_new_blocks = true;
 	pf->discard_enabled = true;
 	pf->discard_passdown = true;
+	pf->provision_enabled = true;
+	pf->provision_passdown = false;
 	pf->error_if_no_space = false;
 }
 
@@ -3209,7 +3252,7 @@ static int parse_pool_features(struct dm_arg_set *as, struct pool_features *pf,
 	const char *arg_name;
 
 	static const struct dm_arg _args[] = {
-		{0, 4, "Invalid number of pool feature arguments"},
+		{0, 5, "Invalid number of pool feature arguments"},
 	};
 
 	/*
@@ -3235,6 +3278,13 @@ static int parse_pool_features(struct dm_arg_set *as, struct pool_features *pf,
 		else if (!strcasecmp(arg_name, "no_discard_passdown"))
 			pf->discard_passdown = false;
 
+		else if (!strcasecmp(arg_name, "ignore_provision"))
+			pf->provision_enabled = false;
+
+		else if (!strcasecmp(arg_name, "provision_passdown")) {
+			pf->provision_passdown = true;
+			DMWARN("EXPERIMENTAL provision_passdown feature in use. Use at your own risk!");
+		}
 		else if (!strcasecmp(arg_name, "read_only"))
 			pf->mode = PM_READ_ONLY;
 
@@ -3432,12 +3482,19 @@ static int pool_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	/*
 	 * 'pool_created' reflects whether this is the first table load.
-	 * Top level discard support is not allowed to be changed after
-	 * initial load.  This would require a pool reload to trigger thin
-	 * device changes.
+	 * Top level discard and provision support is not allowed to be
+	 * changed after initial load.  This would require a pool reload
+	 * to trigger thin device changes.
 	 */
+
 	if (!pool_created && pf.discard_enabled != pool->pf.discard_enabled) {
 		ti->error = "Discard support cannot be disabled once enabled";
+		r = -EINVAL;
+		goto out_flags_changed;
+	}
+
+	if (!pool_created && pf.provision_enabled != pool->pf.provision_enabled) {
+		ti->error = "Provision support cannot be disabled once enabled";
 		r = -EINVAL;
 		goto out_flags_changed;
 	}
@@ -3450,9 +3507,6 @@ static int pool_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	pt->adjusted_pf = pt->requested_pf = pf;
 	ti->num_flush_bios = 1;
 	ti->limit_swap_bios = true;
-	ti->num_provision_bios = 1;
-	ti->provision_supported = true;
-	ti->max_provision_granularity = true;
 
 	/*
 	 * Only need to enable discards if the pool should pass
@@ -3469,6 +3523,18 @@ static int pool_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ti->discards_supported = true;
 		ti->max_discard_granularity = true;
 	}
+
+	/*
+	 * Only need to enable provisions if the pool should pass
+	 * them down to the data device.  The thin device's provision
+	 * processing will cause mappings to be added to the btree.
+	 */
+	if (pf.provision_enabled && pf.provision_passdown) {
+		ti->num_provision_bios = 1;
+		ti->provision_supported = true;
+		ti->max_provision_granularity = true;
+	}
+
 	ti->private = pt;
 
 	r = dm_pool_register_metadata_threshold(pt->pool->pmd,
@@ -3948,9 +4014,10 @@ static int pool_message(struct dm_target *ti, unsigned int argc, char **argv,
 static void emit_flags(struct pool_features *pf, char *result,
 		       unsigned int sz, unsigned int maxlen)
 {
-	unsigned int count = !pf->zero_new_blocks + !pf->discard_enabled +
-		!pf->discard_passdown + (pf->mode == PM_READ_ONLY) +
-		pf->error_if_no_space;
+	unsigned int count = !pf->zero_new_blocks +
+		!pf->discard_enabled + !pf->discard_passdown +
+		!pf->provision_enabled + pf->provision_passdown +
+		(pf->mode == PM_READ_ONLY) + pf->error_if_no_space;
 	DMEMIT("%u ", count);
 
 	if (!pf->zero_new_blocks)
@@ -3961,6 +4028,12 @@ static void emit_flags(struct pool_features *pf, char *result,
 
 	if (!pf->discard_passdown)
 		DMEMIT("no_discard_passdown ");
+
+	if (!pf->provision_enabled)
+		DMEMIT("ignore_provision ");
+
+	if (pf->provision_passdown)
+		DMEMIT("provision_passdown ");
 
 	if (pf->mode == PM_READ_ONLY)
 		DMEMIT("read_only ");
@@ -4072,6 +4145,13 @@ static void pool_status(struct dm_target *ti, status_type_t type,
 		else
 			DMEMIT("no_discard_passdown ");
 
+		if (!pool->pf.provision_enabled)
+			DMEMIT("ignore_provision ");
+		else if (pool->pf.provision_passdown)
+			DMEMIT("provision_passdown ");
+		else
+			DMEMIT("no_provision_passdown ");
+
 		if (pool->pf.error_if_no_space)
 			DMEMIT("error_if_no_space ");
 		else
@@ -4149,8 +4229,6 @@ static void pool_io_hints(struct dm_target *ti, struct queue_limits *limits)
 		blk_limits_io_opt(limits, pool->sectors_per_block << SECTOR_SHIFT);
 	}
 
-	limits->max_provision_sectors = pool->sectors_per_block;
-
 	/*
 	 * pt->adjusted_pf is a staging area for the actual features to use.
 	 * They get transferred to the live pool in bind_control_target()
@@ -4171,6 +4249,18 @@ static void pool_io_hints(struct dm_target *ti, struct queue_limits *limits)
 		 * block layer will stack them if pool's data device has support.
 		 */
 		limits->discard_granularity = 0;
+	}
+
+	if (pt->adjusted_pf.provision_enabled) {
+		disable_provision_passdown_if_not_supported(pt);
+		if (!pt->adjusted_pf.provision_passdown)
+			limits->max_provision_sectors = 0;
+	} else {
+		/*
+		 * Must explicitly disallow stacking provision limits otherwise the
+		 * block layer will stack them if pool's data device has support.
+		 */
+		limits->max_provision_sectors = 0;
 	}
 }
 
@@ -4339,16 +4429,17 @@ static int thin_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ti->accounts_remapped_io = true;
 	ti->per_io_data_size = sizeof(struct dm_thin_endio_hook);
 
-	/* In case the pool supports discards, pass them on. */
 	if (tc->pool->pf.discard_enabled) {
 		ti->discards_supported = true;
 		ti->num_discard_bios = 1;
 		ti->max_discard_granularity = true;
 	}
 
-	ti->num_provision_bios = 1;
-	ti->provision_supported = true;
-	ti->max_provision_granularity = true;
+	if (tc->pool->pf.provision_enabled) {
+		ti->provision_supported = true;
+		ti->num_provision_bios = 1;
+		ti->max_provision_granularity = true;
+	}
 
 	mutex_unlock(&dm_thin_pool_table.mutex);
 
@@ -4563,6 +4654,9 @@ static void thin_io_hints(struct dm_target *ti, struct queue_limits *limits)
 		limits->discard_granularity = pool->sectors_per_block << SECTOR_SHIFT;
 		limits->max_discard_sectors = pool->sectors_per_block * BIO_PRISON_MAX_RANGE;
 	}
+
+	if (pool->pf.provision_enabled)
+		limits->max_provision_sectors = pool->sectors_per_block;
 }
 
 static struct target_type thin_target = {
