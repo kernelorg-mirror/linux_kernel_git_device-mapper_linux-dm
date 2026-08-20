@@ -346,8 +346,15 @@ static int btree_lookup_raw(struct ro_spine *s, dm_block_t block, uint64_t key,
 {
 	int i, r;
 	uint32_t flags, nr_entries;
+	unsigned int depth = 0;
 
 	do {
+		if (depth++ >= DM_BTREE_MAX_DEPTH) {
+			DMERR_LIMIT("%s: exceeded max depth (%u), possible metadata corruption",
+				    __func__, DM_BTREE_MAX_DEPTH);
+			return -ELOOP;
+		}
+
 		r = ro_step(s, block);
 		if (r < 0)
 			return r;
@@ -1095,8 +1102,15 @@ static int btree_insert_raw(struct shadow_spine *s, dm_block_t root,
 {
 	int r, i = *index, top = 1;
 	struct btree_node *node;
+	unsigned int depth = 0;
 
 	for (;;) {
+		if (depth++ >= DM_BTREE_MAX_DEPTH) {
+			DMERR_LIMIT("%s: exceeded max depth (%u), possible metadata corruption",
+				    __func__, DM_BTREE_MAX_DEPTH);
+			return -ELOOP;
+		}
+
 		r = shadow_step(s, root, vt);
 		if (r < 0)
 			return r;
@@ -1158,9 +1172,16 @@ static int __btree_get_overwrite_leaf(struct shadow_spine *s, dm_block_t root,
 {
 	int r, i = -1;
 	struct btree_node *node;
+	unsigned int depth = 0;
 
 	*index = 0;
 	for (;;) {
+		if (depth++ >= DM_BTREE_MAX_DEPTH) {
+			DMERR_LIMIT("%s: exceeded max depth (%u), possible metadata corruption",
+				    __func__, DM_BTREE_MAX_DEPTH);
+			return -ELOOP;
+		}
+
 		r = shadow_step(s, root, &s->info->value_type);
 		if (r < 0)
 			return r;
@@ -1342,8 +1363,15 @@ static int find_key(struct ro_spine *s, dm_block_t block, bool find_highest,
 {
 	int i, r;
 	uint32_t flags;
+	unsigned int depth = 0;
 
 	do {
+		if (depth++ >= DM_BTREE_MAX_DEPTH) {
+			DMERR_LIMIT("%s: exceeded max depth (%u), possible metadata corruption",
+				    __func__, DM_BTREE_MAX_DEPTH);
+			return -ELOOP;
+		}
+
 		r = ro_step(s, block);
 		if (r < 0)
 			return r;

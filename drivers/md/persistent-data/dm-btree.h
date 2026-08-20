@@ -181,6 +181,14 @@ int dm_btree_walk(struct dm_btree_info *info, dm_block_t root,
 /*----------------------------------------------------------------*/
 
 /*
+ * Maximum depth of btree traversal.  Used to detect cycles caused by
+ * metadata corruption (e.g. a node whose value points back to itself).
+ * 16 levels can address well over 200^16 entries, far exceeding any
+ * practical thin pool size.
+ */
+#define DM_BTREE_MAX_DEPTH 16
+
+/*
  * Cursor API.  This does not follow the rolling lock convention.  Since we
  * know the order that values are required we can issue prefetches to speed
  * up iteration.  Use on a single level btree only.

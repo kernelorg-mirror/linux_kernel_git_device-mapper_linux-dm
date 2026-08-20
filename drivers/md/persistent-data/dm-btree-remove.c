@@ -555,8 +555,15 @@ static int remove_raw(struct shadow_spine *s, struct dm_btree_info *info,
 {
 	int i = *index, r;
 	struct btree_node *n;
+	unsigned int depth = 0;
 
 	for (;;) {
+		if (depth++ >= DM_BTREE_MAX_DEPTH) {
+			DMERR_LIMIT("%s: exceeded max depth (%u), possible metadata corruption",
+				    __func__, DM_BTREE_MAX_DEPTH);
+			return -ELOOP;
+		}
+
 		r = shadow_step(s, root, vt);
 		if (r < 0)
 			break;
@@ -649,8 +656,15 @@ static int remove_nearest(struct shadow_spine *s, struct dm_btree_info *info,
 {
 	int i = *index, r;
 	struct btree_node *n;
+	unsigned int depth = 0;
 
 	for (;;) {
+		if (depth++ >= DM_BTREE_MAX_DEPTH) {
+			DMERR_LIMIT("%s: exceeded max depth (%u), possible metadata corruption",
+				    __func__, DM_BTREE_MAX_DEPTH);
+			return -ELOOP;
+		}
+
 		r = shadow_step(s, root, vt);
 		if (r < 0)
 			break;

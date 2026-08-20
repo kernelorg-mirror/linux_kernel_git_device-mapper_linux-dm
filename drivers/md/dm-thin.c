@@ -1997,6 +1997,9 @@ static void process_cell(struct thin_c *tc, struct dm_bio_prison_cell *cell)
 	default:
 		DMERR_LIMIT("%s: dm_thin_find_block() failed: error = %d",
 			    __func__, r);
+		if (r == -ELOOP)
+			metadata_operation_failed(pool,
+						  "btree cycle detected", r);
 		cell_defer_no_holder(tc, cell);
 		bio_io_error(bio);
 		break;
@@ -2065,6 +2068,9 @@ static void __process_bio_read_only(struct thin_c *tc, struct bio *bio,
 	default:
 		DMERR_LIMIT("%s: dm_thin_find_block() failed: error = %d",
 			    __func__, r);
+		if (r == -ELOOP)
+			metadata_operation_failed(tc->pool,
+						  "btree cycle detected", r);
 		if (cell)
 			cell_defer_no_holder(tc, cell);
 		bio_io_error(bio);
@@ -2802,6 +2808,9 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio)
 		 * dm_thin_find_block can fail with -EINVAL if the
 		 * pool is switched to fail-io mode.
 		 */
+		if (r == -ELOOP)
+			metadata_operation_failed(tc->pool,
+						  "btree cycle detected", r);
 		bio_io_error(bio);
 		cell_defer_no_holder(tc, virt_cell);
 		return DM_MAPIO_SUBMITTED;
