@@ -106,6 +106,12 @@ void dm_tm_dec(struct dm_transaction_manager *tm, dm_block_t b);
 void dm_tm_dec_range(struct dm_transaction_manager *tm, dm_block_t b, dm_block_t e);
 
 /*
+ * Clear the sticky space-map error flag.  Should be called at the start
+ * of each new transaction.
+ */
+void dm_tm_clear_error(struct dm_transaction_manager *tm);
+
+/*
  * Builds up runs of adjacent blocks, and then calls the given fn
  * (typically dm_tm_inc/dec).  Very useful when you have to perform
  * the same tm operation on all values in a btree leaf.

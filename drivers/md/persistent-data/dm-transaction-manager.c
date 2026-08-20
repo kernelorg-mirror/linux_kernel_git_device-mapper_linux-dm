@@ -99,6 +99,16 @@ struct dm_transaction_manager {
 	struct rb_root buckets[DM_HASH_SIZE];
 
 	struct prefetch_set prefetches;
+
+	/*
+	 * Sticky error flag for space-map operations (inc/dec) that
+	 * were silently swallowed by the void tm_inc/tm_dec wrappers.
+	 * A non-zero value indicates the transaction is inconsistent
+	 * and must not be committed.  Checked in tm_pre_commit() and
+	 * tm_commit(); cleared by dm_tm_clear_error() at the start of
+	 * each new transaction.
+	 */
+	int sm_error;
 };
 
 /*----------------------------------------------------------------*/
@@ -193,6 +203,7 @@ static struct dm_transaction_manager *dm_tm_create(struct dm_block_manager *bm,
 	tm->real = NULL;
 	tm->bm = bm;
 	tm->sm = sm;
+	tm->sm_error = 0;
 
 	spin_lock_init(&tm->lock);
 	for (i = 0; i < DM_HASH_SIZE; i++)
@@ -236,6 +247,12 @@ int dm_tm_pre_commit(struct dm_transaction_manager *tm)
 	if (tm->is_clone)
 		return -EWOULDBLOCK;
 
+	if (tm->sm_error) {
+		DMERR("aborting pre-commit due to earlier space-map error: %d",
+		      tm->sm_error);
+		return tm->sm_error;
+	}
+
 	r = dm_sm_commit(tm->sm);
 	if (r < 0)
 		return r;
@@ -248,6 +265,13 @@ int dm_tm_commit(struct dm_transaction_manager *tm, struct dm_block *root)
 {
 	if (tm->is_clone)
 		return -EWOULDBLOCK;
+
+	if (tm->sm_error) {
+		DMERR("refusing commit due to earlier space-map error: %d",
+		      tm->sm_error);
+		dm_bm_unlock(root);
+		return tm->sm_error;
+	}
 
 	wipe_shadow_table(tm);
 	dm_bm_unlock(root);
@@ -375,45 +399,87 @@ EXPORT_SYMBOL_GPL(dm_tm_unlock);
 
 void dm_tm_inc(struct dm_transaction_manager *tm, dm_block_t b)
 {
+	int r;
+
 	/*
 	 * The non-blocking clone doesn't support this.
 	 */
 	BUG_ON(tm->is_clone);
 
-	dm_sm_inc_block(tm->sm, b);
+	r = dm_sm_inc_block(tm->sm, b);
+	if (r && !tm->sm_error) {
+		DMERR_LIMIT("dm_tm_inc failed for block %llu: error %d",
+			    (unsigned long long)b, r);
+		tm->sm_error = r;
+	}
 }
 EXPORT_SYMBOL_GPL(dm_tm_inc);
 
 void dm_tm_inc_range(struct dm_transaction_manager *tm, dm_block_t b, dm_block_t e)
 {
+	int r;
+
 	/*
 	 * The non-blocking clone doesn't support this.
 	 */
 	BUG_ON(tm->is_clone);
 
-	dm_sm_inc_blocks(tm->sm, b, e);
+	r = dm_sm_inc_blocks(tm->sm, b, e);
+	if (r && !tm->sm_error) {
+		DMERR_LIMIT("dm_tm_inc_range failed for blocks %llu..%llu: error %d",
+			    (unsigned long long)b, (unsigned long long)e, r);
+		tm->sm_error = r;
+	}
 }
 EXPORT_SYMBOL_GPL(dm_tm_inc_range);
 
 void dm_tm_dec(struct dm_transaction_manager *tm, dm_block_t b)
 {
+	int r;
+
 	/*
 	 * The non-blocking clone doesn't support this.
 	 */
 	BUG_ON(tm->is_clone);
 
-	dm_sm_dec_block(tm->sm, b);
+	r = dm_sm_dec_block(tm->sm, b);
+	if (r && !tm->sm_error) {
+		DMERR_LIMIT("dm_tm_dec failed for block %llu: error %d",
+			    (unsigned long long)b, r);
+		tm->sm_error = r;
+	}
 }
 EXPORT_SYMBOL_GPL(dm_tm_dec);
 
+/*
+ * Clear the sticky space-map error flag.  Called at the start of each
+ * new transaction (in __begin_transaction) so that a fresh transaction
+ * can proceed after the previous one was aborted.
+ */
+void dm_tm_clear_error(struct dm_transaction_manager *tm)
+{
+	if (tm->is_clone)
+		return;
+
+	tm->sm_error = 0;
+}
+EXPORT_SYMBOL_GPL(dm_tm_clear_error);
+
 void dm_tm_dec_range(struct dm_transaction_manager *tm, dm_block_t b, dm_block_t e)
 {
+	int r;
+
 	/*
 	 * The non-blocking clone doesn't support this.
 	 */
 	BUG_ON(tm->is_clone);
 
-	dm_sm_dec_blocks(tm->sm, b, e);
+	r = dm_sm_dec_blocks(tm->sm, b, e);
+	if (r && !tm->sm_error) {
+		DMERR_LIMIT("dm_tm_dec_range failed for blocks %llu..%llu: error %d",
+			    (unsigned long long)b, (unsigned long long)e, r);
+		tm->sm_error = r;
+	}
 }
 EXPORT_SYMBOL_GPL(dm_tm_dec_range);
 

@@ -227,6 +227,16 @@ struct dm_pool_metadata {
 	 */
 	__u8 data_space_map_root[SPACE_MAP_ROOT_SIZE];
 	__u8 metadata_space_map_root[SPACE_MAP_ROOT_SIZE];
+
+	/*
+	 * Sticky error flag for data space-map operations (inc/dec)
+	 * that were silently swallowed by the void value_type inc/dec
+	 * callbacks.  A non-zero value indicates the data space map is
+	 * inconsistent and the transaction must not be committed.
+	 * Checked in __commit_transaction(); cleared in
+	 * __begin_transaction() and dm_pool_abort_metadata().
+	 */
+	int data_sm_error;
 };
 
 struct dm_thin_device {
@@ -324,12 +334,13 @@ static void unpack_block_time(uint64_t v, dm_block_t *b, uint32_t *t)
  */
 typedef int (*run_fn)(struct dm_space_map *, dm_block_t, dm_block_t);
 
-static void with_runs(struct dm_space_map *sm, const __le64 *value_le, unsigned int count, run_fn fn)
+static int with_runs(struct dm_space_map *sm, const __le64 *value_le, unsigned int count, run_fn fn)
 {
 	uint64_t b, begin, end;
 	uint32_t t;
 	bool in_run = false;
 	unsigned int i;
+	int r = 0;
 
 	for (i = 0; i < count; i++, value_le++) {
 		/* We know value_le is 8 byte aligned */
@@ -339,7 +350,9 @@ static void with_runs(struct dm_space_map *sm, const __le64 *value_le, unsigned 
 			if (b == end) {
 				end++;
 			} else {
-				fn(sm, begin, end);
+				r = fn(sm, begin, end);
+				if (r)
+					return r;
 				begin = b;
 				end = b + 1;
 			}
@@ -351,19 +364,35 @@ static void with_runs(struct dm_space_map *sm, const __le64 *value_le, unsigned 
 	}
 
 	if (in_run)
-		fn(sm, begin, end);
+		r = fn(sm, begin, end);
+
+	return r;
 }
 
 static void data_block_inc(void *context, const void *value_le, unsigned int count)
 {
-	with_runs((struct dm_space_map *) context,
-		  (const __le64 *) value_le, count, dm_sm_inc_blocks);
+	struct dm_pool_metadata *pmd = context;
+	int r;
+
+	r = with_runs(pmd->data_sm, (const __le64 *) value_le,
+		      count, dm_sm_inc_blocks);
+	if (r && !pmd->data_sm_error) {
+		DMERR_LIMIT("data_block_inc failed: error %d", r);
+		pmd->data_sm_error = r;
+	}
 }
 
 static void data_block_dec(void *context, const void *value_le, unsigned int count)
 {
-	with_runs((struct dm_space_map *) context,
-		  (const __le64 *) value_le, count, dm_sm_dec_blocks);
+	struct dm_pool_metadata *pmd = context;
+	int r;
+
+	r = with_runs(pmd->data_sm, (const __le64 *) value_le,
+		      count, dm_sm_dec_blocks);
+	if (r && !pmd->data_sm_error) {
+		DMERR_LIMIT("data_block_dec failed: error %d", r);
+		pmd->data_sm_error = r;
+	}
 }
 
 static int data_block_equal(void *context, const void *value1_le, const void *value2_le)
@@ -485,7 +514,7 @@ static void __setup_btree_details(struct dm_pool_metadata *pmd)
 {
 	pmd->info.tm = pmd->tm;
 	pmd->info.levels = 2;
-	pmd->info.value_type.context = pmd->data_sm;
+	pmd->info.value_type.context = pmd;
 	pmd->info.value_type.size = sizeof(__le64);
 	pmd->info.value_type.inc = data_block_inc;
 	pmd->info.value_type.dec = data_block_dec;
@@ -504,7 +533,7 @@ static void __setup_btree_details(struct dm_pool_metadata *pmd)
 
 	pmd->bl_info.tm = pmd->tm;
 	pmd->bl_info.levels = 1;
-	pmd->bl_info.value_type.context = pmd->data_sm;
+	pmd->bl_info.value_type.context = pmd;
 	pmd->bl_info.value_type.size = sizeof(__le64);
 	pmd->bl_info.value_type.inc = data_block_inc;
 	pmd->bl_info.value_type.dec = data_block_dec;
@@ -846,6 +875,15 @@ static int __begin_transaction(struct dm_pool_metadata *pmd)
 	pmd->data_block_size = le32_to_cpu(disk_super->data_block_size);
 
 	dm_bm_unlock(sblock);
+
+	/*
+	 * Start the new transaction with a clean error slate.  Any
+	 * space-map errors from the previous (aborted) transaction
+	 * must not carry over.
+	 */
+	dm_tm_clear_error(pmd->tm);
+	pmd->data_sm_error = 0;
+
 	return 0;
 }
 
@@ -898,6 +936,12 @@ static int __commit_transaction(struct dm_pool_metadata *pmd)
 
 	if (unlikely(!pmd->in_service))
 		return 0;
+
+	if (pmd->data_sm_error) {
+		DMERR("aborting commit due to earlier data space-map error: %d",
+		      pmd->data_sm_error);
+		return pmd->data_sm_error;
+	}
 
 	if (pmd->pre_commit_fn) {
 		r = pmd->pre_commit_fn(pmd->pre_commit_context);
@@ -976,6 +1020,7 @@ struct dm_pool_metadata *dm_pool_metadata_open(struct block_device *bdev,
 	pmd->data_block_size = data_block_size;
 	pmd->pre_commit_fn = NULL;
 	pmd->pre_commit_context = NULL;
+	pmd->data_sm_error = 0;
 
 	r = __create_persistent_data_objects(pmd, format_device);
 	if (r) {
@@ -1894,6 +1939,8 @@ int dm_pool_abort_metadata(struct dm_pool_metadata *pmd)
 	r = __open_or_format_metadata(pmd, false);
 	if (r)
 		pmd->fail_io = true;
+	else
+		pmd->data_sm_error = 0;
 	pmd_write_unlock(pmd);
 	return r;
 }
